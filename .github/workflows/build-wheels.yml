@@ -44,8 +44,9 @@ jobs:
           curl -L "https://github.com/OSGeo/gdal/releases/download/v${GDAL_VERSION}/gdal-${GDAL_VERSION}.tar.gz" \
             -o /tmp/gdal-src.tar.gz
           tar -xzf /tmp/gdal-src.tar.gz -C /tmp
-          # swig/python 裡已有完整的 setup.py + osgeo/ + extensions/
-          echo "GDAL_PYTHON_SRC=/tmp/gdal-${GDAL_VERSION}/swig/python" >> $GITHUB_ENV
+          # cibuildwheel Linux 用 Docker，package_dir 必須在 GITHUB_WORKSPACE 內
+          cp -r /tmp/gdal-${GDAL_VERSION}/swig/python $GITHUB_WORKSPACE/gdal_python_src
+          echo "GDAL_PYTHON_SRC=$GITHUB_WORKSPACE/gdal_python_src" >> $GITHUB_ENV
 
       - name: Build
         env:
