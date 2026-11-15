@@ -18,7 +18,7 @@ env:
   GDAL_VERSION: ${{ github.event.inputs.gdal_version || '3.9.3' }}
 
 # ════════════════════════════════════════════════════════════════════
-#  Linux  –  manylinux_2_28 (glibc ≥ 2.28)
+#  Linux  –  manylinux_2_28
 # ════════════════════════════════════════════════════════════════════
 jobs:
   build-linux:
@@ -39,6 +39,14 @@ jobs:
       - name: Install cibuildwheel
         run: pip install cibuildwheel==2.22.0
 
+      - name: Fetch GDAL source (host)
+        run: |
+          curl -L "https://github.com/OSGeo/gdal/releases/download/v${GDAL_VERSION}/gdal-${GDAL_VERSION}.tar.gz" \
+            -o /tmp/gdal-src.tar.gz
+          tar -xzf /tmp/gdal-src.tar.gz -C /tmp
+          # swig/python 裡已有完整的 setup.py + osgeo/ + extensions/
+          echo "GDAL_PYTHON_SRC=/tmp/gdal-${GDAL_VERSION}/swig/python" >> $GITHUB_ENV
+
       - name: Build
         env:
           CIBW_BUILD: "${{ matrix.python }}-manylinux_x86_64"
@@ -51,10 +59,6 @@ jobs:
               hdf5-devel netcdf-devel \
               postgresql-devel \
               cmake make gcc gcc-c++ swig
-            curl -L "https://github.com/OSGeo/gdal/releases/download/v${GDAL_VERSION}/gdal-${GDAL_VERSION}.tar.gz" \
-              -o /tmp/gdal-src.tar.gz
-            tar -xzf /tmp/gdal-src.tar.gz -C /tmp
-            cp -r /tmp/gdal-${GDAL_VERSION}/swig/python/. /project/gdal_wheels/
           CIBW_BEFORE_BUILD: pip install numpy setuptools wheel
           CIBW_ENVIRONMENT: >
             GDAL_CONFIG=/usr/bin/gdal-config
@@ -65,7 +69,7 @@ jobs:
               -w {dest_dir} {wheel}
           CIBW_TEST_COMMAND: >
             python -c "from osgeo import gdal; print('GDAL OK:', gdal.__version__)"
-        run: cibuildwheel --output-dir wheelhouse gdal_wheels/
+        run: cibuildwheel --output-dir wheelhouse ${{ env.GDAL_PYTHON_SRC }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -73,7 +77,7 @@ jobs:
           path: wheelhouse/*.whl
 
 # ════════════════════════════════════════════════════════════════════
-#  macOS  –  arm64 (Apple Silicon) + x86_64 (Intel)
+#  macOS  –  arm64 + x86_64
 # ════════════════════════════════════════════════════════════════════
   build-macos:
     name: "macOS · ${{ matrix.python }} · ${{ matrix.arch }}"
@@ -82,10 +86,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # arm64 — macos-15 是當前 ARM64 標準 runner
           - { python: cp311, arch: arm64,  runner: macos-15 }
           - { python: cp312, arch: arm64,  runner: macos-15 }
-          # x86_64 — macos-13 已退役 (Nov 2025)，改用 macos-15-intel
           - { python: cp311, arch: x86_64, runner: macos-15-intel }
           - { python: cp312, arch: x86_64, runner: macos-15-intel }
 
@@ -109,7 +111,7 @@ jobs:
           curl -L "https://github.com/OSGeo/gdal/releases/download/v${GDAL_VERSION}/gdal-${GDAL_VERSION}.tar.gz" \
             -o /tmp/gdal-src.tar.gz
           tar -xzf /tmp/gdal-src.tar.gz -C /tmp
-          cp -r /tmp/gdal-${GDAL_VERSION}/swig/python/. gdal_wheels/
+          echo "GDAL_PYTHON_SRC=/tmp/gdal-${GDAL_VERSION}/swig/python" >> $GITHUB_ENV
 
       - uses: actions/setup-python@v5
         with:
@@ -132,7 +134,7 @@ jobs:
               -w {dest_dir} -v {wheel}
           CIBW_TEST_COMMAND: >
             python -c "from osgeo import gdal; print('GDAL OK:', gdal.__version__)"
-        run: cibuildwheel --output-dir wheelhouse gdal_wheels/
+        run: cibuildwheel --output-dir wheelhouse ${{ env.GDAL_PYTHON_SRC }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -140,7 +142,7 @@ jobs:
           path: wheelhouse/*.whl
 
 # ════════════════════════════════════════════════════════════════════
-#  Windows  –  x86_64，通過 vcpkg 安裝 GDAL
+#  Windows  –  x86_64 via vcpkg
 # ════════════════════════════════════════════════════════════════════
   build-windows:
     name: "Windows · ${{ matrix.python }}"
@@ -174,7 +176,7 @@ jobs:
           $url = "https://github.com/OSGeo/gdal/releases/download/v$env:GDAL_VERSION/gdal-$env:GDAL_VERSION.tar.gz"
           Invoke-WebRequest $url -OutFile "$env:TEMP\gdal-src.tar.gz"
           tar -xzf "$env:TEMP\gdal-src.tar.gz" -C "$env:TEMP"
-          Copy-Item "$env:TEMP\gdal-$env:GDAL_VERSION\swig\python\*" gdal_wheels\ -Recurse -Force
+          echo "GDAL_PYTHON_SRC=$env:TEMP\gdal-$env:GDAL_VERSION\swig\python" >> $env:GITHUB_ENV
         shell: pwsh
 
       - uses: actions/setup-python@v5
@@ -201,7 +203,7 @@ jobs:
               -w {dest_dir} {wheel}
           CIBW_TEST_COMMAND: >
             python -c "from osgeo import gdal; print('GDAL OK:', gdal.__version__)"
-        run: cibuildwheel --output-dir wheelhouse gdal_wheels/
+        run: cibuildwheel --output-dir wheelhouse ${{ env.GDAL_PYTHON_SRC }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -209,7 +211,7 @@ jobs:
           path: wheelhouse/*.whl
 
 # ════════════════════════════════════════════════════════════════════
-#  Release  –  推 tag 時自動收集所有 wheel 並發佈
+#  Release  –  推 tag 時自動發佈
 # ════════════════════════════════════════════════════════════════════
   release:
     name: "Publish Release"
