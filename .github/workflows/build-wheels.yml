@@ -1,260 +1,277 @@
 name: Build GDAL Wheels
 
+# Version selection (first match wins):
+#   1. tag push        v3.13.3            -> 3.13.3
+#   2. manual run      input gdal_version -> that version
+#   3. everything else DEFAULT_GDAL_VERSION below
 on:
   push:
     branches: [main]
-    tags:
-      - 'v*'
+    tags: ['v*']
+    paths-ignore: ['**/*.md']
   pull_request:
     branches: [main]
+    paths-ignore: ['**/*.md']
   workflow_dispatch:
     inputs:
       gdal_version:
-        description: 'GDAL version (e.g. 3.9.3)'
+        description: 'GDAL version X.Y.Z (must exist on PyPI and in GitHub releases). Empty = default.'
         required: false
-        default: '3.9.3'
+        type: string
+
+# A new push cancels the superseded PR run; branch/tag runs are never cancelled.
+concurrency:
+  group: wheels-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 env:
-  GDAL_VERSION: ${{ github.event.inputs.gdal_version || '3.9.3' }}
+  DEFAULT_GDAL_VERSION: '3.13.3'
+  PROJ_VERSION: '9.9.0'                 # only used for the Linux/macOS source build
+  CIBUILDWHEEL_VERSION: '3.4.1'
+  # Pull requests get a fast signal (one Python); main / tags / manual runs build everything.
+  CIBW_BUILD: ${{ github.event_name == 'pull_request' && 'cp312-*' || 'cp310-* cp311-* cp312-* cp313-* cp314-*' }}
+  CIBW_SKIP: '*-win32 *_i686 *-musllinux_* pp*'
+  CIBW_BUILD_VERBOSITY: '1'
 
-# ════════════════════════════════════════════════════════════════════
-#  Linux  –  manylinux_2_28
-#  流程：cmake 生成 setup.py + extensions/*.cpp → cibuildwheel 打包
-# ════════════════════════════════════════════════════════════════════
 jobs:
-  build-linux:
-    name: "Linux · ${{ matrix.python }}"
+  # ══════════════════════════════════════════════════════════════════
+  #  1. Resolve the version and fetch the Python-bindings sdist ONCE.
+  #     The PyPI sdist ships pre-generated SWIG wrappers, so no cmake /
+  #     SWIG / full GDAL configure is needed to build the bindings.
+  # ══════════════════════════════════════════════════════════════════
+  prepare:
+    name: Fetch GDAL sdist
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: [cp39, cp310, cp311, cp312]
-
+    timeout-minutes: 10
+    outputs:
+      gdal_version: ${{ steps.ver.outputs.gdal_version }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install cibuildwheel
-        run: pip install cibuildwheel==2.22.0
-
-      - name: Fetch GDAL source into workspace
-        run: |
-          curl -L "https://github.com/OSGeo/gdal/releases/download/v${GDAL_VERSION}/gdal-${GDAL_VERSION}.tar.gz" \
-            -o /tmp/gdal-src.tar.gz
-          tar -xzf /tmp/gdal-src.tar.gz -C $GITHUB_WORKSPACE
-          echo "GDAL_SRC=$GITHUB_WORKSPACE/gdal-${GDAL_VERSION}" >> $GITHUB_ENV
-
-      - name: Build
+      - name: Resolve GDAL version
+        id: ver
         env:
-          CIBW_BUILD: "${{ matrix.python }}-manylinux_x86_64"
-          CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64
-          # BEFORE_ALL 在容器內執行：
-          # 1. 裝系統依賴 2. cmake 生成 setup.py + extensions/*.cpp
-          CIBW_BEFORE_ALL_LINUX: |
-            dnf install -y epel-release
-            dnf install -y \
-              gdal-devel proj-devel geos-devel \
-              sqlite-devel libcurl-devel \
-              hdf5-devel netcdf-devel \
-              postgresql-devel \
-              cmake make gcc gcc-c++ swig
-            GDAL_SRC=/project/gdal-${GDAL_VERSION}
-            mkdir -p /tmp/gdal-build
-            cmake -S "$GDAL_SRC" -B /tmp/gdal-build \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DBUILD_PYTHON_BINDINGS=ON \
-              -DGDAL_PYTHON_INSTALL_PREFIX=/tmp/gdal-install \
-              -DGDAL_USE_HDF5=OFF \
-              -DGDAL_USE_NETCDF=OFF
-            cmake --build /tmp/gdal-build --target python_generated_files -j$(nproc)
-            # 把生成的 setup.py 和 extensions/ 複製到 swig/python
-            cp /tmp/gdal-build/swig/python/setup.py "$GDAL_SRC/swig/python/"
-            cp -r /tmp/gdal-build/swig/python/extensions "$GDAL_SRC/swig/python/"
-          CIBW_BEFORE_BUILD: pip install numpy setuptools wheel
-          CIBW_ENVIRONMENT: >
-            GDAL_CONFIG=/usr/bin/gdal-config
-            GDAL_VERSION=${{ env.GDAL_VERSION }}
-          CIBW_REPAIR_WHEEL_COMMAND: >
-            auditwheel repair
-              --plat manylinux_2_28_x86_64
-              -w {dest_dir} {wheel}
-          CIBW_TEST_COMMAND: >
-            python -c "from osgeo import gdal; print('GDAL OK:', gdal.__version__)"
-        run: cibuildwheel --output-dir wheelhouse ${{ env.GDAL_SRC }}/swig/python
+          INPUT_VERSION: ${{ inputs.gdal_version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"
+          elif [[ -n "${INPUT_VERSION:-}" ]]; then v="$INPUT_VERSION"
+          else v="$DEFAULT_GDAL_VERSION"; fi
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid GDAL version '$v' (expected X.Y.Z)"; exit 1; }
+          echo "gdal_version=$v" >> "$GITHUB_OUTPUT"
+          echo "Building GDAL $v"
+
+      - name: Download sdist from PyPI (checksum verified)
+        env:
+          GDAL_VERSION: ${{ steps.ver.outputs.gdal_version }}
+        run: |
+          set -euo pipefail
+          meta="$(curl -fsSL --retry 3 "https://pypi.org/pypi/gdal/${GDAL_VERSION}/json")"
+          url="$(jq -r '[.urls[] | select(.packagetype=="sdist")][0].url' <<<"$meta")"
+          sha="$(jq -r '[.urls[] | select(.packagetype=="sdist")][0].digests.sha256' <<<"$meta")"
+          curl -fsSL --retry 3 -o gdal-sdist.tar.gz "$url"
+          echo "$sha  gdal-sdist.tar.gz" | sha256sum -c -
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-linux-${{ matrix.python }}
-          path: wheelhouse/*.whl
+          name: gdal-sdist
+          path: gdal-sdist.tar.gz
+          retention-days: 7
 
-# ════════════════════════════════════════════════════════════════════
-#  macOS  –  arm64 + x86_64
-#  流程：cmake 生成 setup.py + extensions/*.cpp → cibuildwheel 打包
-# ════════════════════════════════════════════════════════════════════
+  # ══════════════════════════════════════════════════════════════════
+  #  2. Linux (manylinux_2_28, x86_64)
+  #     One cibuildwheel run for ALL Python versions, so PROJ + libgdal
+  #     are compiled once (BEFORE_ALL), not once per Python version.
+  # ══════════════════════════════════════════════════════════════════
+  build-linux:
+    name: Linux · manylinux_2_28
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: gdal-sdist
+
+      - name: Prepare source tree
+        run: |
+          python ci/prepare_sdist.py gdal-sdist.tar.gz gdal-src \
+            --gdal-config /opt/gdal/bin/gdal-config \
+            --copy ci/build-libgdal.sh --copy ci/smoke_test.py
+
+      - run: python -m pip install "cibuildwheel==${CIBUILDWHEEL_VERSION}"
+
+      - name: Build wheels
+        run: cibuildwheel --output-dir wheelhouse gdal-src
+        env:
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          # Runs once inside the container; /project is the copied gdal-src directory.
+          CIBW_BEFORE_ALL_LINUX: >-
+            dnf install -y sqlite sqlite-devel &&
+            /opt/python/cp312-cp312/bin/python -m pip install cmake ninja &&
+            PATH=/opt/python/cp312-cp312/bin:$PATH
+            bash /project/build-libgdal.sh /opt/gdal
+            ${{ needs.prepare.outputs.gdal_version }} ${{ env.PROJ_VERSION }}
+          # build-time only: lets the linker resolve libgdal's own dependency (libproj)
+          CIBW_ENVIRONMENT_LINUX: LDFLAGS="-Wl,-rpath-link,/opt/gdal/lib"
+          # LD_LIBRARY_PATH is scoped to the repair step so the tests prove the wheel is self-contained
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
+            LD_LIBRARY_PATH=/opt/gdal/lib:$LD_LIBRARY_PATH
+            auditwheel repair -w {dest_dir} {wheel}
+          CIBW_TEST_COMMAND: python {project}/smoke_test.py ${{ needs.prepare.outputs.gdal_version }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+  # ══════════════════════════════════════════════════════════════════
+  #  3. macOS (arm64 + x86_64)
+  #     libgdal/PROJ prefix is cached, so only the first run (or a
+  #     version/script change) pays for the compile.
+  # ══════════════════════════════════════════════════════════════════
   build-macos:
-    name: "macOS · ${{ matrix.python }} · ${{ matrix.arch }}"
+    name: macOS · ${{ matrix.arch }}
+    needs: prepare
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { python: cp311, arch: arm64,  runner: macos-15 }
-          - { python: cp312, arch: arm64,  runner: macos-15 }
-          - { python: cp311, arch: x86_64, runner: macos-15-intel }
-          - { python: cp312, arch: x86_64, runner: macos-15-intel }
-
+          - { arch: arm64,  runner: macos-15,       target: '11.0' }
+          - { arch: x86_64, runner: macos-15-intel, target: '10.15' }
     steps:
       - uses: actions/checkout@v4
-
-      - name: Cache Homebrew
-        uses: actions/cache@v4
-        with:
-          path: ~/Library/Caches/Homebrew
-          key: brew-${{ matrix.runner }}-gdal-${{ env.GDAL_VERSION }}
-          restore-keys: brew-${{ matrix.runner }}-gdal-
-
-      - name: Install dependencies via Homebrew
-        run: |
-          brew update
-          brew install gdal proj geos hdf5 netcdf swig cmake
-
-      - name: Fetch GDAL source & cmake generate
-        run: |
-          curl -L "https://github.com/OSGeo/gdal/releases/download/v${GDAL_VERSION}/gdal-${GDAL_VERSION}.tar.gz" \
-            -o /tmp/gdal-src.tar.gz
-          tar -xzf /tmp/gdal-src.tar.gz -C $GITHUB_WORKSPACE
-          GDAL_SRC=$GITHUB_WORKSPACE/gdal-${GDAL_VERSION}
-          mkdir -p /tmp/gdal-build
-          cmake -S "$GDAL_SRC" -B /tmp/gdal-build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_PYTHON_BINDINGS=ON \
-            -DGDAL_PYTHON_INSTALL_PREFIX=/tmp/gdal-install
-          cmake --build /tmp/gdal-build --target python_generated_files -j$(sysctl -n hw.logicalcpu)
-          cp /tmp/gdal-build/swig/python/setup.py "$GDAL_SRC/swig/python/"
-          cp -r /tmp/gdal-build/swig/python/extensions "$GDAL_SRC/swig/python/"
-          echo "GDAL_SRC=$GDAL_SRC" >> $GITHUB_ENV
-
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: gdal-sdist
 
-      - name: Install cibuildwheel
-        run: pip install cibuildwheel==2.22.0
+      - name: Cache libgdal + PROJ
+        id: libgdal
+        uses: actions/cache@v4
+        with:
+          path: ~/gdal-prefix
+          key: libgdal-macos-${{ matrix.arch }}-t${{ matrix.target }}-gdal${{ needs.prepare.outputs.gdal_version }}-proj${{ env.PROJ_VERSION }}-${{ hashFiles('ci/build-libgdal.sh') }}
 
-      - name: Build
+      - name: Build libgdal + PROJ
+        if: steps.libgdal.outputs.cache-hit != 'true'
         env:
-          CIBW_BUILD: "${{ matrix.python }}-macosx_*"
-          CIBW_ARCHS_MACOS: ${{ matrix.arch }}
-          CIBW_BEFORE_BUILD: pip install numpy setuptools wheel
-          CIBW_ENVIRONMENT_MACOS: >
-            GDAL_CONFIG=$(brew --prefix gdal)/bin/gdal-config
-            GDAL_VERSION=${{ env.GDAL_VERSION }}
-          CIBW_REPAIR_WHEEL_COMMAND_MACOS: >
-            delocate-wheel
-              --require-archs {delocate_archs}
-              -w {dest_dir} -v {wheel}
-          CIBW_TEST_COMMAND: >
-            python -c "from osgeo import gdal; print('GDAL OK:', gdal.__version__)"
-        run: cibuildwheel --output-dir wheelhouse ${{ env.GDAL_SRC }}/swig/python
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.target }}
+        run: |
+          python -m pip install cmake ninja
+          bash ci/build-libgdal.sh "$HOME/gdal-prefix" \
+            "${{ needs.prepare.outputs.gdal_version }}" "$PROJ_VERSION"
+
+      - name: Prepare source tree
+        run: |
+          python ci/prepare_sdist.py gdal-sdist.tar.gz gdal-src \
+            --gdal-config "$HOME/gdal-prefix/bin/gdal-config" \
+            --copy ci/smoke_test.py
+
+      - run: python -m pip install "cibuildwheel==${CIBUILDWHEEL_VERSION}"
+
+      - name: Build wheels
+        run: cibuildwheel --output-dir wheelhouse gdal-src
+        env:
+          CIBW_ENVIRONMENT_MACOS: MACOSX_DEPLOYMENT_TARGET=${{ matrix.target }}
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: >-
+            DYLD_LIBRARY_PATH=$HOME/gdal-prefix/lib
+            delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}
+          CIBW_TEST_COMMAND: python {project}/smoke_test.py ${{ needs.prepare.outputs.gdal_version }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-macos-${{ matrix.python }}-${{ matrix.arch }}
+          name: wheels-macos-${{ matrix.arch }}
           path: wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 14
 
-# ════════════════════════════════════════════════════════════════════
-#  Windows  –  x86_64 via vcpkg
-# ════════════════════════════════════════════════════════════════════
+  # ══════════════════════════════════════════════════════════════════
+  #  4. Windows (x86_64)
+  #     libgdal comes prebuilt from conda-forge (seconds, not a vcpkg
+  #     compile). Paths go into setup.cfg, so there is no
+  #     CIBW_ENVIRONMENT to mis-quote (the original "Malformed
+  #     environment option" error).
+  # ══════════════════════════════════════════════════════════════════
   build-windows:
-    name: "Windows · ${{ matrix.python }}"
+    name: Windows · x86_64
+    needs: prepare
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: [cp39, cp310, cp311, cp312]
-
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-
-      - name: Cache vcpkg
-        uses: actions/cache@v4
-        with:
-          path: C:\vcpkg\installed
-          key: vcpkg-gdal-${{ runner.os }}-${{ env.GDAL_VERSION }}
-          restore-keys: vcpkg-gdal-${{ runner.os }}-
-
-      - name: Install GDAL via vcpkg
-        run: |
-          if (-not (Test-Path "C:\vcpkg")) {
-            git clone https://github.com/microsoft/vcpkg C:\vcpkg
-            C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
-          }
-          choco install swig -y
-          C:\vcpkg\vcpkg install gdal:x64-windows
-        shell: pwsh
-
-      - name: Fetch GDAL source & cmake generate
-        run: |
-          $url = "https://github.com/OSGeo/gdal/releases/download/v$env:GDAL_VERSION/gdal-$env:GDAL_VERSION.tar.gz"
-          Invoke-WebRequest $url -OutFile "$env:TEMP\gdal-src.tar.gz"
-          tar -xzf "$env:TEMP\gdal-src.tar.gz" -C "$env:GITHUB_WORKSPACE"
-          $GDAL_SRC = "$env:GITHUB_WORKSPACE\gdal-$env:GDAL_VERSION"
-          cmake -S "$GDAL_SRC" -B "$env:TEMP\gdal-build" `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DBUILD_PYTHON_BINDINGS=ON `
-            -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake `
-            -DVCPKG_TARGET_TRIPLET=x64-windows
-          cmake --build "$env:TEMP\gdal-build" --target python_generated_files
-          Copy-Item "$env:TEMP\gdal-build\swig\python\setup.py" "$GDAL_SRC\swig\python\"
-          Copy-Item "$env:TEMP\gdal-build\swig\python\extensions" "$GDAL_SRC\swig\python\" -Recurse -Force
-          echo "GDAL_SRC=$GDAL_SRC" >> $env:GITHUB_ENV
-        shell: pwsh
-
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: gdal-sdist
+
+      - name: Cache conda package downloads
+        uses: actions/cache@v4
+        with:
+          path: C:\mamba-root\pkgs
+          key: mamba-pkgs-win-gdal${{ needs.prepare.outputs.gdal_version }}
+
+      - name: Install libgdal from conda-forge
+        shell: pwsh
+        run: |
+          $mm = Join-Path $env:RUNNER_TEMP 'micromamba.exe'
+          Invoke-WebRequest -Uri 'https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-win-64' -OutFile $mm
+          & $mm create -y -r C:\mamba-root -p C:\gdal-env -c conda-forge --override-channels "libgdal-core=${{ needs.prepare.outputs.gdal_version }}"
+          if ($LASTEXITCODE -ne 0) { throw "micromamba create failed" }
+          # fail early if the layout is not what the build expects
+          Get-Item C:\gdal-env\Library\include\gdal.h, C:\gdal-env\Library\lib\gdal.lib, C:\gdal-env\Library\bin\gdal.dll | Out-Null
+
+      - name: Prepare source tree
+        shell: pwsh
+        run: |
+          python ci/prepare_sdist.py gdal-sdist.tar.gz gdal-src `
+            --include-dir C:/gdal-env/Library/include `
+            --library-dir C:/gdal-env/Library/lib `
+            --copy ci/smoke_test.py
 
       - name: Install cibuildwheel
-        run: pip install cibuildwheel==2.22.0
+        shell: pwsh
+        run: python -m pip install "cibuildwheel==$env:CIBUILDWHEEL_VERSION"
 
-      - name: Build
+      - name: Build wheels
+        shell: pwsh
+        run: cibuildwheel --output-dir wheelhouse gdal-src
         env:
-          CIBW_BUILD: "${{ matrix.python }}-win_amd64"
-          CIBW_BEFORE_BUILD: "pip install numpy setuptools wheel delvewheel"
-          CIBW_ENVIRONMENT_WINDOWS: >
-            GDAL_HOME=C:\vcpkg\installed\x64-windows
-            PROJ_DIR=C:\vcpkg\installed\x64-windows
-            INCLUDE=C:\vcpkg\installed\x64-windows\include
-            LIB=C:\vcpkg\installed\x64-windows\lib
-            PATH=C:\vcpkg\installed\x64-windows\bin;$PATH
-            GDAL_VERSION=${{ env.GDAL_VERSION }}
-          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >
-            delvewheel repair
-              --add-path C:\vcpkg\installed\x64-windows\bin
-              -w {dest_dir} {wheel}
-          CIBW_TEST_COMMAND: >
-            python -c "from osgeo import gdal; print('GDAL OK:', gdal.__version__)"
-        run: cibuildwheel --output-dir wheelhouse ${{ env.GDAL_SRC }}\swig\python
+          CIBW_BEFORE_BUILD_WINDOWS: pip install delvewheel
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
+            delvewheel repair --add-path C:\gdal-env\Library\bin -w {dest_dir} {wheel}
+          CIBW_TEST_COMMAND: python {project}/smoke_test.py ${{ needs.prepare.outputs.gdal_version }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-windows-${{ matrix.python }}
+          name: wheels-windows
           path: wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 14
 
-# ════════════════════════════════════════════════════════════════════
-#  Release  –  推 tag 時自動發佈
-# ════════════════════════════════════════════════════════════════════
+  # ══════════════════════════════════════════════════════════════════
+  #  5. Publish on tag push
+  # ══════════════════════════════════════════════════════════════════
   release:
-    name: "Publish Release"
-    needs: [build-linux, build-macos, build-windows]
+    name: Publish Release
+    needs: [prepare, build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
-
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -262,12 +279,11 @@ jobs:
           path: dist/
           merge-multiple: true
 
-      - name: Show collected wheels
-        run: ls -lh dist/
+      - run: ls -lh dist/
 
-      - name: Publish to GitHub Release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
           files: dist/*.whl
+          fail_on_unmatched_files: true
           generate_release_notes: true
-          name: "GDAL ${{ env.GDAL_VERSION }} wheels"
+          name: GDAL ${{ needs.prepare.outputs.gdal_version }} wheels
