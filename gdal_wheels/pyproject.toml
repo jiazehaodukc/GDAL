@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "numpy>=1.21"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "GDAL"
+dynamic = ["version"]
+description = "GDAL: Geospatial Data Abstraction Library"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21"]
+
+[tool.cibuildwheel]
+build-verbosity = 1
