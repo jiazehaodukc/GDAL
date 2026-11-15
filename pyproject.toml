@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "numpy>=1.24"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "gdal-wheels"
+dynamic = ["version"]
+description = "GDAL Python bindings - pre-built wheels for Mac/Windows/Linux"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.24"]
+
+[tool.cibuildwheel]
+# 跳過 32 位、PyPy、musl libc
+skip = ["*-win32", "*-manylinux_i686", "pp*", "*-musllinux*"]
+build-verbosity = 1
+
+[tool.cibuildwheel.linux]
+before-build = "pip install numpy"
+
+[tool.cibuildwheel.macos]
+before-build = "pip install numpy"
+
+[tool.cibuildwheel.windows]
+before-build = "pip install numpy"

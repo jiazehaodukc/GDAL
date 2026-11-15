@@ -1,0 +1,223 @@
+name: Build GDAL Wheels
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      gdal_version:
+        description: 'GDAL version (e.g. 3.9.3)'
+        required: false
+        default: '3.9.3'
+
+env:
+  GDAL_VERSION: ${{ github.event.inputs.gdal_version || '3.9.3' }}
+
+# ════════════════════════════════════════════════════════════════════
+#  Linux  –  manylinux_2_28 (glibc ≥ 2.28, 兼容 Debian 10+)
+# ════════════════════════════════════════════════════════════════════
+jobs:
+  build-linux:
+    name: "Linux · ${{ matrix.python }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: [cp39, cp310, cp311, cp312]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cibuildwheel
+        run: pip install cibuildwheel==2.21.3
+
+      - name: Build
+        env:
+          CIBW_BUILD: "${{ matrix.python }}-manylinux_x86_64"
+          CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64
+          # 在 manylinux 容器裡安裝 GDAL 及所有依賴
+          CIBW_BEFORE_ALL_LINUX: |
+            dnf install -y epel-release
+            dnf install -y \
+              gdal-devel proj-devel geos-devel \
+              sqlite-devel libcurl-devel \
+              hdf5-devel netcdf-devel \
+              postgresql-devel \
+              cmake make gcc gcc-c++
+          CIBW_BEFORE_BUILD: pip install numpy
+          CIBW_ENVIRONMENT: >
+            GDAL_CONFIG=/usr/bin/gdal-config
+            GDAL_VERSION=${{ env.GDAL_VERSION }}
+          # auditwheel 把依賴的 .so 打包進 wheel
+          CIBW_REPAIR_WHEEL_COMMAND: >
+            auditwheel repair
+              --plat manylinux_2_28_x86_64
+              -w {dest_dir} {wheel}
+          CIBW_TEST_COMMAND: >
+            python -c "from osgeo import gdal; print('GDAL OK:', gdal.__version__)"
+        run: cibuildwheel --output-dir wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.python }}
+          path: wheelhouse/*.whl
+
+# ════════════════════════════════════════════════════════════════════
+#  macOS  –  arm64 (Apple Silicon) + x86_64 (Intel)
+# ════════════════════════════════════════════════════════════════════
+  build-macos:
+    name: "macOS · ${{ matrix.python }} · ${{ matrix.arch }}"
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Apple Silicon ──
+          - { python: cp311, arch: arm64,  runner: macos-14 }
+          - { python: cp312, arch: arm64,  runner: macos-14 }
+          # ── Intel ──
+          - { python: cp311, arch: x86_64, runner: macos-13 }
+          - { python: cp312, arch: x86_64, runner: macos-13 }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 緩存 Homebrew bottles，加速後續構建
+      - name: Cache Homebrew
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: brew-${{ matrix.runner }}-gdal
+
+      - name: Install GDAL via Homebrew
+        run: |
+          brew update
+          brew install gdal proj geos hdf5 netcdf
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cibuildwheel
+        run: pip install cibuildwheel==2.21.3
+
+      - name: Build
+        env:
+          CIBW_BUILD: "${{ matrix.python }}-macosx_*"
+          CIBW_ARCHS_MACOS: ${{ matrix.arch }}
+          CIBW_BEFORE_BUILD: pip install numpy
+          CIBW_ENVIRONMENT_MACOS: >
+            GDAL_CONFIG=$(brew --prefix gdal)/bin/gdal-config
+            GDAL_VERSION=${{ env.GDAL_VERSION }}
+          # delocate 把依賴的 dylib 打包進 wheel
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: >
+            delocate-wheel
+              --require-archs {delocate_archs}
+              -w {dest_dir} -v {wheel}
+          CIBW_TEST_COMMAND: >
+            python -c "from osgeo import gdal; print('GDAL OK:', gdal.__version__)"
+        run: cibuildwheel --output-dir wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.python }}-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+
+# ════════════════════════════════════════════════════════════════════
+#  Windows  –  x86_64, 通過 vcpkg 安裝 GDAL
+# ════════════════════════════════════════════════════════════════════
+  build-windows:
+    name: "Windows · ${{ matrix.python }}"
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: [cp39, cp310, cp311, cp312]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 緩存 vcpkg 編譯結果（GDAL 在 Windows 上編譯很慢）
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-gdal-${{ runner.os }}-${{ hashFiles('**/vcpkg.json') }}
+          restore-keys: vcpkg-gdal-${{ runner.os }}-
+
+      - name: Install GDAL via vcpkg
+        run: |
+          if (-not (Test-Path "C:\vcpkg")) {
+            git clone https://github.com/microsoft/vcpkg C:\vcpkg
+            C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          }
+          C:\vcpkg\vcpkg install gdal:x64-windows
+        shell: pwsh
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cibuildwheel
+        run: pip install cibuildwheel==2.21.3
+
+      - name: Build
+        env:
+          CIBW_BUILD: "${{ matrix.python }}-win_amd64"
+          CIBW_BEFORE_BUILD: "pip install numpy delvewheel"
+          CIBW_ENVIRONMENT_WINDOWS: >
+            GDAL_HOME=C:\vcpkg\installed\x64-windows
+            PROJ_DIR=C:\vcpkg\installed\x64-windows
+            INCLUDE=C:\vcpkg\installed\x64-windows\include
+            LIB=C:\vcpkg\installed\x64-windows\lib
+            PATH=C:\vcpkg\installed\x64-windows\bin;$PATH
+            GDAL_VERSION=${{ env.GDAL_VERSION }}
+          # delvewheel 把依賴的 .dll 打包進 wheel
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >
+            delvewheel repair
+              --add-path C:\vcpkg\installed\x64-windows\bin
+              -w {dest_dir} {wheel}
+          CIBW_TEST_COMMAND: >
+            python -c "from osgeo import gdal; print('GDAL OK:', gdal.__version__)"
+        run: cibuildwheel --output-dir wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ matrix.python }}
+          path: wheelhouse/*.whl
+
+# ════════════════════════════════════════════════════════════════════
+#  Release  –  收集所有 wheel，推 tag 時自動發佈
+# ════════════════════════════════════════════════════════════════════
+  release:
+    name: "Publish Release"
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Show collected wheels
+        run: ls -lh dist/
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          generate_release_notes: true
+          name: "GDAL ${{ env.GDAL_VERSION }} wheels"
