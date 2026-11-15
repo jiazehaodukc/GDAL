@@ -18,7 +18,7 @@ env:
   GDAL_VERSION: ${{ github.event.inputs.gdal_version || '3.9.3' }}
 
 # ════════════════════════════════════════════════════════════════════
-#  Linux  –  manylinux_2_28 (glibc ≥ 2.28, 兼容 Debian 10+)
+#  Linux  –  manylinux_2_28 (glibc ≥ 2.28)
 # ════════════════════════════════════════════════════════════════════
 jobs:
   build-linux:
@@ -34,10 +34,10 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install cibuildwheel
-        run: pip install cibuildwheel==2.21.3
+        run: pip install cibuildwheel==2.22.0
 
       - name: Build
         env:
@@ -51,11 +51,10 @@ jobs:
               hdf5-devel netcdf-devel \
               postgresql-devel \
               cmake make gcc gcc-c++ swig
-            # 下載並準備 GDAL Python 綁定
             curl -L "https://github.com/OSGeo/gdal/releases/download/v${GDAL_VERSION}/gdal-${GDAL_VERSION}.tar.gz" \
               -o /tmp/gdal-src.tar.gz
             tar -xzf /tmp/gdal-src.tar.gz -C /tmp
-            cp -r /tmp/gdal-${GDAL_VERSION}/swig/python/* /project/gdal_wheels/
+            cp -r /tmp/gdal-${GDAL_VERSION}/swig/python/. /project/gdal_wheels/
           CIBW_BEFORE_BUILD: pip install numpy setuptools wheel
           CIBW_ENVIRONMENT: >
             GDAL_CONFIG=/usr/bin/gdal-config
@@ -83,10 +82,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── Apple Silicon (arm64) — macos-14/15 are native ARM64 runners ──
-          - { python: cp311, arch: arm64,  runner: macos-14 }
-          - { python: cp312, arch: arm64,  runner: macos-14 }
-          # ── Intel (x86_64) — macos-13 retired Nov 2025; use macos-15-intel ──
+          # arm64 — macos-15 是當前 ARM64 標準 runner
+          - { python: cp311, arch: arm64,  runner: macos-15 }
+          - { python: cp312, arch: arm64,  runner: macos-15 }
+          # x86_64 — macos-13 已退役 (Nov 2025)，改用 macos-15-intel
           - { python: cp311, arch: x86_64, runner: macos-15-intel }
           - { python: cp312, arch: x86_64, runner: macos-15-intel }
 
@@ -110,14 +109,14 @@ jobs:
           curl -L "https://github.com/OSGeo/gdal/releases/download/v${GDAL_VERSION}/gdal-${GDAL_VERSION}.tar.gz" \
             -o /tmp/gdal-src.tar.gz
           tar -xzf /tmp/gdal-src.tar.gz -C /tmp
-          cp -r /tmp/gdal-${GDAL_VERSION}/swig/python/* gdal_wheels/
+          cp -r /tmp/gdal-${GDAL_VERSION}/swig/python/. gdal_wheels/
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install cibuildwheel
-        run: pip install cibuildwheel==2.21.3
+        run: pip install cibuildwheel==2.22.0
 
       - name: Build
         env:
@@ -141,7 +140,7 @@ jobs:
           path: wheelhouse/*.whl
 
 # ════════════════════════════════════════════════════════════════════
-#  Windows  –  x86_64, 通過 vcpkg 安裝 GDAL
+#  Windows  –  x86_64，通過 vcpkg 安裝 GDAL
 # ════════════════════════════════════════════════════════════════════
   build-windows:
     name: "Windows · ${{ matrix.python }}"
@@ -180,10 +179,10 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install cibuildwheel
-        run: pip install cibuildwheel==2.21.3
+        run: pip install cibuildwheel==2.22.0
 
       - name: Build
         env:
@@ -210,7 +209,7 @@ jobs:
           path: wheelhouse/*.whl
 
 # ════════════════════════════════════════════════════════════════════
-#  Release  –  收集所有 wheel，推 tag 時自動發佈
+#  Release  –  推 tag 時自動收集所有 wheel 並發佈
 # ════════════════════════════════════════════════════════════════════
   release:
     name: "Publish Release"
