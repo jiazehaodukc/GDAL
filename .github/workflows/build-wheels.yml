@@ -192,7 +192,8 @@ jobs:
             git clone https://github.com/microsoft/vcpkg C:\vcpkg
             C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
           }
-          C:\vcpkg\vcpkg install gdal:x64-windows swig:x64-windows
+          choco install swig -y
+          C:\vcpkg\vcpkg install gdal:x64-windows
         shell: pwsh
 
       - name: Fetch GDAL source & cmake generate
